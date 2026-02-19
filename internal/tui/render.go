@@ -19,6 +19,7 @@ var (
 		"201",
 		"51",
 		"248",
+		"245", // garbage line color
 	}
 
 	blockChars = []string{"  ", "██"}
