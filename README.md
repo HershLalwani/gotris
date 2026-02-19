@@ -1,112 +1,75 @@
-# Gotris
+# gotris
 
-Multiplayer Tetris TUI game inspired by Tetris 99. Play with friends over SSH!
+Multiplayer Tetris in the terminal, written in Go. Play solo or against friends over the network -- all from your terminal.
 
-## Features
+Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) for the TUI and [gorilla/websocket](https://github.com/gorilla/websocket) for multiplayer.
 
-- **Single Player Mode** - Practice mode for testing and casual play
-- Real-time multiplayer Tetris over SSH
-- Lobby system with player ready status
-- Tetris 99-style garbage line attacks
-- Bubble Tea TUI with colorful blocks
-- Supports multiple concurrent games
+## How to play
+
+### Single-player
+
+Just run it:
+
+```
+go run . [name]
+```
+
+### Multiplayer
+
+Start the server:
+
+```
+go run ./cmd/server
+```
+
+Then each player connects with the client:
+
+```
+go run ./cmd/client --server ws://localhost:8080/ws --name yourname
+```
+
+The `--server` flag defaults to `ws://localhost:8080/ws` and `--name` defaults to your OS username, so locally you can just do:
+
+```
+go run ./cmd/client
+```
+
+Once everyone is in the lobby, press space to ready up. The game starts when all players are ready (minimum 2).
+
+## Controls
+
+| Key | Action |
+|---|---|
+| Left / Right | Move piece |
+| Down | Soft drop |
+| Up | Rotate |
+| Space | Hard drop |
+| C | Hold piece |
+| Q / Ctrl+C | Quit |
+
+## How multiplayer works
+
+All players in a match receive the same random seed, so the 7-bag piece sequence is identical for everyone. The server coordinates lobby state, broadcasts board snapshots between opponents, and handles garbage line attacks.
+
+When you clear 2+ lines, garbage gets sent to a random opponent. Their board gets pushed up with junk rows that have a single gap. Last player alive wins.
+
+## Project layout
+
+```
+main.go                    single-player entry point
+cmd/
+  server/main.go           WebSocket game server
+  client/main.go           multiplayer client entry point
+internal/
+  game/tetris.go           core Tetris logic (board, pieces, 7-bag, scoring)
+  tui/model.go             Bubble Tea model, input handling, game loop
+  tui/render.go            all the rendering (board, lobby, opponents, etc.)
+  netclient/client.go      WebSocket client wrapper
+  player/lobby.go          server-side lobby/player management
+  protocol/messages.go     shared message types for client-server protocol
+```
 
 ## Requirements
 
-- Go 1.21+
-- SSH client (to connect)
-
-## Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/hersh/gotris.git
-cd gotris
-
-# Build
-go build -o gotris .
-
-# Generate SSH host key (if not exists)
-mkdir -p .ssh
-ssh-keygen -t ed25519 -f .ssh/id_ed25519 -N ""
-```
-
-## Running
-
-### Start the server
-
-```bash
-./gotris
-```
-
-The server will start on `localhost:2222` by default.
-
-### Connect to play
-
-Open multiple terminals and connect:
-
-```bash
-ssh -p 2222 localhost
-```
-
-Or connect from another machine:
-
-```bash
-ssh -p 2222 user@your-server-ip
-```
-
-## Gameplay
-
-### Game Modes
-
-1. **Single Player** - Press `1` or `S` at the welcome screen for practice mode
-2. **Multiplayer** - Press `2` or `ENTER` to join the multiplayer lobby
-
-### Controls
-
-| Key | Action |
-|-----|--------|
-| `←` / `h` | Move left |
-| `→` / `l` | Move right |
-| `↓` / `j` | Soft drop |
-| `↑` / `x` | Rotate |
-| `Space` | Hard drop |
-| `z` | Hold piece |
-| `q` | Quit |
-
-### Multiplayer Lobby
-
-1. Select Multiplayer mode at welcome screen
-2. Press `SPACE` to toggle ready status
-3. Game starts when all players are ready (minimum 2 players)
-
-### Attack System (Tetris 99 style)
-
-- Clear lines to send garbage to opponents
-- 2 lines = 1 garbage row
-- 3 lines = 2 garbage rows
-- 4 lines (Tetris) = 4 garbage rows
-- Last player standing wins!
-
-## Project Structure
-
-```
-gotris/
-├── main.go                    # Server entry point
-├── internal/
-│   ├── game/
-│   │   └── tetris.go          # Core Tetris game logic
-│   ├── player/
-│   │   └── lobby.go           # Player management
-│   ├── server/
-│   │   └── match.go           # Multiplayer game coordination
-│   └── tui/
-│       ├── model.go           # Bubble Tea model
-│       └── render.go          # Rendering functions
-└── .ssh/
-    └── id_ed25519             # SSH host key
-```
-
-## License
-
-MIT
+- Go 1.25+
+- A terminal that supports alternate screen and basic ANSI colors (basically anything modern)
