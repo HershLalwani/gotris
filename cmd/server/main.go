@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -59,7 +60,7 @@ func newPlayer(id string, conn *websocket.Conn) *Player {
 		ID:     id,
 		Conn:   conn,
 		Alive:  true,
-		sendCh: make(chan []byte, 256),
+		sendCh: make(chan []byte, 64),
 	}
 }
 
@@ -98,6 +99,8 @@ func (p *Player) send(env protocol.Envelope) {
 		log.Printf("marshal error for player %s: %v", p.ID, err)
 		return
 	}
+	// Recover from panic if sendCh was closed (player disconnected).
+	defer func() { recover() }()
 	select {
 	case p.sendCh <- data:
 	default:
@@ -505,8 +508,16 @@ func (h *Hub) removeRoomIfEmpty(code string) {
 	defer h.mu.Unlock()
 	if room, ok := h.rooms[code]; ok {
 		if room.playerCount() == 0 {
+			// Signal broadcastLoop to stop (safety net).
+			select {
+			case <-room.stopCh:
+			default:
+				close(room.stopCh)
+			}
 			delete(h.rooms, code)
 			log.Printf("Room %s removed (empty)", code)
+			// Return freed memory to the OS in the background.
+			go debug.FreeOSMemory()
 		}
 	}
 }
@@ -746,6 +757,10 @@ func handlePlay(hub *Hub, w http.ResponseWriter, r *http.Request) {
 
 	// Cleanup on disconnect
 	room.removePlayer(p.ID)
+	close(p.sendCh) // immediately stops writePump goroutine
+	p.mu.Lock()
+	p.Snapshot = nil // free board data
+	p.mu.Unlock()
 	log.Printf("Player %s (%s) left room %s", p.Name, p.ID, room.code)
 	if room.playerCount() == 0 {
 		room.resetToLobby()
