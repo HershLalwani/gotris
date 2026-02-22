@@ -11,8 +11,14 @@ import (
 	"github.com/hersh/gotris/internal/tui"
 )
 
+// DefaultServer is the default server address.
+// Override at build time with:
+//
+//	go build -ldflags "-X main.DefaultServer=https://your-app.railway.app" ./cmd/client
+var DefaultServer = "http://localhost:8080"
+
 func main() {
-	serverAddr := flag.String("server", "ws://localhost:8080/ws", "WebSocket server address")
+	serverAddr := flag.String("server", DefaultServer, "Server HTTP address")
 	playerName := flag.String("name", "", "Player name (defaults to OS username)")
 	flag.Parse()
 
@@ -25,13 +31,8 @@ func main() {
 		}
 	}
 
-	// Connect to server
-	client, err := netclient.New(*serverAddr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect to server at %s: %v\n", *serverAddr, err)
-		fmt.Fprintf(os.Stderr, "Make sure the server is running (go run ./cmd/server)\n")
-		os.Exit(1)
-	}
+	// Create the client (HTTP only at startup, no WS connection yet)
+	client := netclient.New(*serverAddr)
 	defer client.Close()
 
 	// Create the bubbletea model
@@ -44,11 +45,10 @@ func main() {
 		tea.WithMouseCellMotion(),
 	)
 
-	// Wire the program into the client so readPump can send tea.Msgs
+	// Wire the program into the client so WS readPump can send tea.Msgs
 	client.SetProgram(p)
-	client.Start()
 
-	// Run the TUI (blocking)
+	// Run the TUI (blocking) — no server connection needed to start
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -26,6 +28,7 @@ const (
 	pingInterval      = (pongWait * 9) / 10
 	maxMessageSize    = 16384
 	minPlayers        = 2
+	roomCodeLength    = 5
 )
 
 // --- Upgrader ---
@@ -45,6 +48,7 @@ type Player struct {
 	Alive  bool
 	Conn   *websocket.Conn
 	sendCh chan []byte
+	roomID string
 	// Latest snapshot from this client
 	mu       sync.Mutex
 	Snapshot *protocol.BoardSnapshotPayload
@@ -101,21 +105,21 @@ func (p *Player) send(env protocol.Envelope) {
 	}
 }
 
-// --- Match ---
+// --- Room ---
 
-type MatchPhase int
+type RoomPhase int
 
 const (
-	PhaseLobby MatchPhase = iota
+	PhaseLobby RoomPhase = iota
 	PhaseCountdown
 	PhasePlaying
 	PhaseGameOver
 )
 
-type Match struct {
+type Room struct {
 	mu        sync.RWMutex
-	id        string
-	phase     MatchPhase
+	code      string
+	phase     RoomPhase
 	players   map[string]*Player
 	seed      int64
 	countdown int
@@ -123,48 +127,49 @@ type Match struct {
 	stopCh    chan struct{}
 }
 
-func newMatch(id string) *Match {
-	return &Match{
-		id:      id,
+func newRoom(code string) *Room {
+	return &Room{
+		code:    code,
 		phase:   PhaseLobby,
 		players: make(map[string]*Player),
 		stopCh:  make(chan struct{}),
 	}
 }
 
-func (m *Match) addPlayer(p *Player) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.players[p.ID] = p
+func (r *Room) addPlayer(p *Player) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.players[p.ID] = p
+	p.roomID = r.code
 }
 
-func (m *Match) removePlayer(id string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (r *Room) removePlayer(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	if p, ok := m.players[id]; ok {
-		close(p.sendCh)
-		delete(m.players, id)
+	if p, ok := r.players[id]; ok {
+		p.roomID = ""
+		delete(r.players, id)
 	}
 
 	// If we're playing and a player leaves, mark them dead
-	if m.phase == PhasePlaying {
-		m.checkWinCondition()
+	if r.phase == PhasePlaying {
+		r.checkWinCondition()
 	}
 }
 
-func (m *Match) playerCount() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.players)
+func (r *Room) playerCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.players)
 }
 
-func (m *Match) broadcastLobbyUpdate() {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (r *Room) broadcastLobbyUpdate() {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
 	var players []protocol.LobbyPlayer
-	for _, p := range m.players {
+	for _, p := range r.players {
 		players = append(players, protocol.LobbyPlayer{
 			PlayerID: p.ID,
 			Name:     p.Name,
@@ -177,19 +182,19 @@ func (m *Match) broadcastLobbyUpdate() {
 		Payload: protocol.LobbyUpdatePayload{Players: players},
 	}
 
-	for _, p := range m.players {
+	for _, p := range r.players {
 		p.send(env)
 	}
 }
 
-func (m *Match) canStart() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (r *Room) canStart() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
-	if len(m.players) < minPlayers {
+	if len(r.players) < minPlayers {
 		return false
 	}
-	for _, p := range m.players {
+	for _, p := range r.players {
 		if !p.Ready {
 			return false
 		}
@@ -197,36 +202,36 @@ func (m *Match) canStart() bool {
 	return true
 }
 
-func (m *Match) startCountdown() {
-	m.mu.Lock()
-	m.phase = PhaseCountdown
-	m.countdown = 3
-	m.mu.Unlock()
+func (r *Room) startCountdown() {
+	r.mu.Lock()
+	r.phase = PhaseCountdown
+	r.countdown = 3
+	r.mu.Unlock()
 
 	go func() {
 		for i := 3; i > 0; i-- {
-			m.mu.Lock()
-			m.countdown = i
-			m.mu.Unlock()
+			r.mu.Lock()
+			r.countdown = i
+			r.mu.Unlock()
 
-			m.broadcastToAll(protocol.Envelope{
+			r.broadcastToAll(protocol.Envelope{
 				Type:    protocol.MsgCountdown,
 				Payload: protocol.CountdownPayload{Value: i},
 			})
 			time.Sleep(time.Second)
 		}
-		m.startGame()
+		r.startGame()
 	}()
 }
 
-func (m *Match) startGame() {
-	m.mu.Lock()
-	m.phase = PhasePlaying
-	m.seed = rand.Int63()
-	m.winnerID = ""
+func (r *Room) startGame() {
+	r.mu.Lock()
+	r.phase = PhasePlaying
+	r.seed = rand.Int63()
+	r.winnerID = ""
 
 	var playerIDs []string
-	for id, p := range m.players {
+	for id, p := range r.players {
 		playerIDs = append(playerIDs, id)
 		p.Alive = true
 		p.Ready = false
@@ -234,50 +239,50 @@ func (m *Match) startGame() {
 		p.Snapshot = nil
 		p.mu.Unlock()
 	}
-	m.mu.Unlock()
+	r.mu.Unlock()
 
-	m.broadcastToAll(protocol.Envelope{
+	r.broadcastToAll(protocol.Envelope{
 		Type: protocol.MsgGameStart,
 		Payload: protocol.GameStartPayload{
-			Seed:    m.seed,
+			Seed:    r.seed,
 			Players: playerIDs,
 		},
 	})
 
 	// Start the broadcast loop
-	go m.broadcastLoop()
+	go r.broadcastLoop()
 }
 
 // broadcastLoop sends OpponentUpdate to all players every broadcastInterval.
-func (m *Match) broadcastLoop() {
+func (r *Room) broadcastLoop() {
 	ticker := time.NewTicker(broadcastInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			m.mu.RLock()
-			phase := m.phase
-			m.mu.RUnlock()
+			r.mu.RLock()
+			phase := r.phase
+			r.mu.RUnlock()
 
 			if phase != PhasePlaying {
 				return
 			}
-			m.sendOpponentUpdates()
-		case <-m.stopCh:
+			r.sendOpponentUpdates()
+		case <-r.stopCh:
 			return
 		}
 	}
 }
 
 // sendOpponentUpdates builds and sends each player their opponents' states.
-func (m *Match) sendOpponentUpdates() {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (r *Room) sendOpponentUpdates() {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
 	// Collect all snapshots
 	allStates := make(map[string]protocol.OpponentState)
-	for _, p := range m.players {
+	for _, p := range r.players {
 		p.mu.Lock()
 		snap := p.Snapshot
 		p.mu.Unlock()
@@ -297,14 +302,17 @@ func (m *Match) sendOpponentUpdates() {
 		allStates[p.ID] = state
 	}
 
-	// Send each player everyone else's state
-	for _, p := range m.players {
+	// Send each player everyone else's state (sorted by ID for stable order)
+	for _, p := range r.players {
 		var opponents []protocol.OpponentState
 		for id, state := range allStates {
 			if id != p.ID {
 				opponents = append(opponents, state)
 			}
 		}
+		sort.Slice(opponents, func(i, j int) bool {
+			return opponents[i].PlayerID < opponents[j].PlayerID
+		})
 		p.send(protocol.Envelope{
 			Type:    protocol.MsgOpponentUpdate,
 			Payload: protocol.OpponentUpdatePayload{Opponents: opponents},
@@ -312,26 +320,26 @@ func (m *Match) sendOpponentUpdates() {
 	}
 }
 
-func (m *Match) broadcastToAll(env protocol.Envelope) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, p := range m.players {
+func (r *Room) broadcastToAll(env protocol.Envelope) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, p := range r.players {
 		p.send(env)
 	}
 }
 
 // handleLinesCleared calculates garbage and routes it to a random opponent.
-func (m *Match) handleLinesCleared(attackerID string, payload protocol.LinesClearedPayload) {
+func (r *Room) handleLinesCleared(attackerID string, payload protocol.LinesClearedPayload) {
 	if payload.AttackPower <= 0 {
 		return
 	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
 	// Pick a random alive opponent
 	var targets []string
-	for id, p := range m.players {
+	for id, p := range r.players {
 		if id != attackerID && p.Alive {
 			targets = append(targets, id)
 		}
@@ -342,7 +350,7 @@ func (m *Match) handleLinesCleared(attackerID string, payload protocol.LinesClea
 	}
 
 	targetID := targets[rand.Intn(len(targets))]
-	target := m.players[targetID]
+	target := r.players[targetID]
 	if target != nil {
 		target.send(protocol.Envelope{
 			Type: protocol.MsgReceiveGarbage,
@@ -355,40 +363,40 @@ func (m *Match) handleLinesCleared(attackerID string, payload protocol.LinesClea
 }
 
 // handlePlayerDead marks a player as dead and checks for a winner.
-func (m *Match) handlePlayerDead(playerID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (r *Room) handlePlayerDead(playerID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	if p, ok := m.players[playerID]; ok {
+	if p, ok := r.players[playerID]; ok {
 		p.Alive = false
 	}
 
-	m.checkWinCondition()
+	r.checkWinCondition()
 }
 
-// checkWinCondition must be called with m.mu held.
-func (m *Match) checkWinCondition() {
+// checkWinCondition must be called with r.mu held.
+func (r *Room) checkWinCondition() {
 	var alive []*Player
-	for _, p := range m.players {
+	for _, p := range r.players {
 		if p.Alive {
 			alive = append(alive, p)
 		}
 	}
 
-	if len(alive) <= 1 && len(m.players) >= minPlayers {
-		m.phase = PhaseGameOver
+	if len(alive) <= 1 && len(r.players) >= minPlayers {
+		r.phase = PhaseGameOver
 		winnerID := ""
 		winnerName := ""
 		if len(alive) == 1 {
 			winnerID = alive[0].ID
 			winnerName = alive[0].Name
-			m.winnerID = winnerID
+			r.winnerID = winnerID
 		}
 
-		// Compute ranks: alive player gets rank 1, dead players count from bottom
-		totalPlayers := len(m.players)
-		for _, p := range m.players {
-			rank := totalPlayers // last place by default
+		// Compute ranks: alive player gets rank 1, dead players last
+		totalPlayers := len(r.players)
+		for _, p := range r.players {
+			rank := totalPlayers
 			if p.ID == winnerID {
 				rank = 1
 			}
@@ -405,53 +413,53 @@ func (m *Match) checkWinCondition() {
 		// Reset for next round
 		go func() {
 			time.Sleep(2 * time.Second)
-			m.mu.Lock()
-			m.phase = PhaseLobby
-			for _, p := range m.players {
+			r.mu.Lock()
+			r.phase = PhaseLobby
+			for _, p := range r.players {
 				p.Alive = true
 				p.Ready = false
 			}
-			m.mu.Unlock()
-			m.broadcastLobbyUpdate()
+			r.mu.Unlock()
+			r.broadcastLobbyUpdate()
 		}()
 	}
 }
 
-func (m *Match) resetToLobby() {
-	m.mu.Lock()
-	m.phase = PhaseLobby
-	for _, p := range m.players {
+func (r *Room) resetToLobby() {
+	r.mu.Lock()
+	r.phase = PhaseLobby
+	for _, p := range r.players {
 		p.Ready = false
 		p.Alive = true
 	}
-	m.mu.Unlock()
+	r.mu.Unlock()
 }
 
 // --- Hub ---
 
+// PendingJoin tracks a player who created/joined a room via HTTP
+// and is expected to connect via WebSocket with the given token.
+type PendingJoin struct {
+	RoomCode   string
+	PlayerName string
+	PlayerID   string
+	CreatedAt  time.Time
+}
+
 type Hub struct {
-	mu      sync.RWMutex
-	matches map[string]*Match
-	nextID  int
+	mu           sync.RWMutex
+	rooms        map[string]*Room        // code -> Room
+	players      map[string]*Player      // playerID -> Player
+	pendingJoins map[string]*PendingJoin // token -> PendingJoin
+	nextID       int
 }
 
 func newHub() *Hub {
 	return &Hub{
-		matches: make(map[string]*Match),
+		rooms:        make(map[string]*Room),
+		players:      make(map[string]*Player),
+		pendingJoins: make(map[string]*PendingJoin),
 	}
-}
-
-func (h *Hub) getOrCreateMainMatch() *Match {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	matchID := "main"
-	if m, ok := h.matches[matchID]; ok {
-		return m
-	}
-	m := newMatch(matchID)
-	h.matches[matchID] = m
-	return m
 }
 
 func (h *Hub) generatePlayerID() string {
@@ -461,44 +469,296 @@ func (h *Hub) generatePlayerID() string {
 	return fmt.Sprintf("player_%d_%d", time.Now().UnixMilli(), h.nextID)
 }
 
-// --- Connection Handler ---
+func (h *Hub) generateRoomCode() string {
+	const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	for {
+		code := make([]byte, roomCodeLength)
+		for i := range code {
+			code[i] = charset[rand.Intn(len(charset))]
+		}
+		c := string(code)
+		if _, exists := h.rooms[c]; !exists {
+			return c
+		}
+	}
+}
 
-func handleConnection(hub *Hub, w http.ResponseWriter, r *http.Request) {
+func (h *Hub) createRoom() *Room {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	code := h.generateRoomCode()
+	room := newRoom(code)
+	h.rooms[code] = room
+	log.Printf("Room %s created", code)
+	return room
+}
+
+func (h *Hub) getRoom(code string) *Room {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.rooms[strings.ToUpper(code)]
+}
+
+func (h *Hub) removeRoomIfEmpty(code string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if room, ok := h.rooms[code]; ok {
+		if room.playerCount() == 0 {
+			delete(h.rooms, code)
+			log.Printf("Room %s removed (empty)", code)
+		}
+	}
+}
+
+func (h *Hub) generateToken() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.nextID++
+	return fmt.Sprintf("tok_%d_%d", time.Now().UnixNano(), h.nextID)
+}
+
+func (h *Hub) addPendingJoin(token string, pj *PendingJoin) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Clean up expired tokens while we're here
+	now := time.Now()
+	for t, p := range h.pendingJoins {
+		if now.Sub(p.CreatedAt) > 60*time.Second {
+			delete(h.pendingJoins, t)
+		}
+	}
+	h.pendingJoins[token] = pj
+}
+
+func (h *Hub) consumeToken(token string) *PendingJoin {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	pj, ok := h.pendingJoins[token]
+	if !ok {
+		return nil
+	}
+	delete(h.pendingJoins, token)
+	if time.Since(pj.CreatedAt) > 60*time.Second {
+		return nil
+	}
+	return pj
+}
+
+func (h *Hub) addPlayer(p *Player) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.players[p.ID] = p
+}
+
+func (h *Hub) removePlayer(id string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.players, id)
+}
+
+// --- HTTP Handlers (Front Desk) ---
+
+func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+func handleCreateRoom(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req protocol.CreateRoomRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, protocol.ErrorResponse{Error: "invalid request body"})
+		return
+	}
+
+	if strings.TrimSpace(req.PlayerName) == "" {
+		req.PlayerName = "Player"
+	}
+
+	room := hub.createRoom()
+	playerID := hub.generatePlayerID()
+	token := hub.generateToken()
+
+	hub.addPendingJoin(token, &PendingJoin{
+		RoomCode:   room.code,
+		PlayerName: req.PlayerName,
+		PlayerID:   playerID,
+		CreatedAt:  time.Now(),
+	})
+
+	log.Printf("Room %s created via HTTP for player %q (pending token)", room.code, req.PlayerName)
+
+	writeJSON(w, http.StatusOK, protocol.CreateRoomResponse{
+		RoomID:    room.code,
+		JoinToken: token,
+	})
+}
+
+func handleJoinRoom(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req protocol.JoinRoomHTTPRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, protocol.ErrorResponse{Error: "invalid request body"})
+		return
+	}
+
+	code := strings.ToUpper(strings.TrimSpace(req.RoomID))
+	room := hub.getRoom(code)
+	if room == nil {
+		writeJSON(w, http.StatusNotFound, protocol.ErrorResponse{Error: fmt.Sprintf("room %q not found", code)})
+		return
+	}
+
+	room.mu.RLock()
+	phase := room.phase
+	room.mu.RUnlock()
+	if phase != PhaseLobby {
+		writeJSON(w, http.StatusConflict, protocol.ErrorResponse{Error: "game already in progress"})
+		return
+	}
+
+	if strings.TrimSpace(req.PlayerName) == "" {
+		req.PlayerName = "Player"
+	}
+
+	playerID := hub.generatePlayerID()
+	token := hub.generateToken()
+
+	hub.addPendingJoin(token, &PendingJoin{
+		RoomCode:   code,
+		PlayerName: req.PlayerName,
+		PlayerID:   playerID,
+		CreatedAt:  time.Now(),
+	})
+
+	log.Printf("Player %q joining room %s via HTTP (pending token)", req.PlayerName, code)
+
+	writeJSON(w, http.StatusOK, protocol.JoinRoomHTTPResponse{
+		RoomID:    code,
+		JoinToken: token,
+	})
+}
+
+func handleListRooms(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	hub.mu.RLock()
+	rooms := make([]protocol.RoomInfo, 0, len(hub.rooms))
+	for _, room := range hub.rooms {
+		room.mu.RLock()
+		phaseStr := "lobby"
+		switch room.phase {
+		case PhaseCountdown:
+			phaseStr = "countdown"
+		case PhasePlaying:
+			phaseStr = "playing"
+		case PhaseGameOver:
+			phaseStr = "game_over"
+		}
+		rooms = append(rooms, protocol.RoomInfo{
+			RoomID:      room.code,
+			PlayerCount: len(room.players),
+			MaxPlayers:  8,
+			Phase:       phaseStr,
+		})
+		room.mu.RUnlock()
+	}
+	hub.mu.RUnlock()
+
+	writeJSON(w, http.StatusOK, protocol.ListRoomsResponse{Rooms: rooms})
+}
+
+// --- WebSocket Handler (Game Room) ---
+
+// handlePlay upgrades to WebSocket for a player who already has a join token.
+func handlePlay(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	roomCode := r.URL.Query().Get("room")
+	token := r.URL.Query().Get("token")
+
+	if roomCode == "" || token == "" {
+		http.Error(w, "missing room or token query parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Validate and consume token
+	pj := hub.consumeToken(token)
+	if pj == nil {
+		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
+		return
+	}
+
+	if pj.RoomCode != strings.ToUpper(roomCode) {
+		http.Error(w, "token does not match room", http.StatusForbidden)
+		return
+	}
+
+	room := hub.getRoom(pj.RoomCode)
+	if room == nil {
+		http.Error(w, "room not found", http.StatusNotFound)
+		return
+	}
+
+	// Upgrade to WebSocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("upgrade error: %v", err)
 		return
 	}
 
-	playerID := hub.generatePlayerID()
-	p := newPlayer(playerID, conn)
-	match := hub.getOrCreateMainMatch()
+	// Create the player from pending join info
+	p := newPlayer(pj.PlayerID, conn)
+	p.Name = pj.PlayerName
+	p.Ready = false
+	p.Alive = true
+
+	hub.addPlayer(p)
+	room.addPlayer(p)
+
+	log.Printf("Player %s (%s) connected to room %s via WebSocket", p.Name, p.ID, room.code)
 
 	// Send player their ID
 	p.send(protocol.Envelope{
 		Type:    protocol.MsgAssignID,
-		Payload: protocol.AssignIDPayload{PlayerID: playerID},
+		Payload: protocol.AssignIDPayload{PlayerID: p.ID},
 	})
 
 	// Start write pump
 	go p.writePump()
 
+	// Broadcast lobby update so everyone sees the new player
+	room.broadcastLobbyUpdate()
+
 	// Read pump (blocking)
-	readPump(p, match)
+	readPump(p, hub)
 
 	// Cleanup on disconnect
-	match.removePlayer(playerID)
-	log.Printf("Player %s (%s) disconnected", p.Name, playerID)
-
-	if match.playerCount() == 0 {
-		match.resetToLobby()
+	room.removePlayer(p.ID)
+	log.Printf("Player %s (%s) left room %s", p.Name, p.ID, room.code)
+	if room.playerCount() == 0 {
+		room.resetToLobby()
+		hub.removeRoomIfEmpty(room.code)
 	} else {
-		match.broadcastLobbyUpdate()
+		room.broadcastLobbyUpdate()
 	}
+	hub.removePlayer(p.ID)
+	log.Printf("Player %s (%s) disconnected", p.Name, p.ID)
 }
 
 // readPump reads messages from the WebSocket and dispatches them.
-func readPump(p *Player, match *Match) {
+func readPump(p *Player, hub *Hub) {
 	defer p.Conn.Close()
 
 	p.Conn.SetReadLimit(maxMessageSize)
@@ -523,30 +783,41 @@ func readPump(p *Player, match *Match) {
 			continue
 		}
 
-		handleMessage(p, match, env, message)
+		handleMessage(p, hub, env, message)
 	}
 }
 
 // handleMessage dispatches a client message.
-func handleMessage(p *Player, match *Match, env protocol.Envelope, raw []byte) {
+func handleMessage(p *Player, hub *Hub, env protocol.Envelope, raw []byte) {
 	switch env.Type {
-	case protocol.MsgJoin:
-		var payload protocol.JoinPayload
-		if extractPayload(raw, &payload) == nil {
-			p.Name = payload.PlayerName
-			match.addPlayer(p)
-			log.Printf("Player %s (%s) joined", p.Name, p.ID)
-			match.broadcastLobbyUpdate()
+	case protocol.MsgLeaveRoom:
+		if p.roomID != "" {
+			code := p.roomID
+			room := hub.getRoom(code)
+			if room != nil {
+				room.removePlayer(p.ID)
+				log.Printf("Player %s (%s) left room %s via message", p.Name, p.ID, code)
+				if room.playerCount() == 0 {
+					room.resetToLobby()
+					hub.removeRoomIfEmpty(code)
+				} else {
+					room.broadcastLobbyUpdate()
+				}
+			}
 		}
 
 	case protocol.MsgReady:
 		var payload protocol.ReadyPayload
 		if extractPayload(raw, &payload) == nil {
+			room := hub.getRoom(p.roomID)
+			if room == nil {
+				return
+			}
 			p.Ready = payload.Ready
-			match.broadcastLobbyUpdate()
+			room.broadcastLobbyUpdate()
 
-			if match.canStart() {
-				match.startCountdown()
+			if room.canStart() {
+				room.startCountdown()
 			}
 		}
 
@@ -561,11 +832,17 @@ func handleMessage(p *Player, match *Match, env protocol.Envelope, raw []byte) {
 	case protocol.MsgLinesCleared:
 		var payload protocol.LinesClearedPayload
 		if extractPayload(raw, &payload) == nil {
-			match.handleLinesCleared(p.ID, payload)
+			room := hub.getRoom(p.roomID)
+			if room != nil {
+				room.handleLinesCleared(p.ID, payload)
+			}
 		}
 
 	case protocol.MsgPlayerDead:
-		match.handlePlayerDead(p.ID)
+		room := hub.getRoom(p.roomID)
+		if room != nil {
+			room.handlePlayerDead(p.ID)
+		}
 
 	default:
 		log.Printf("unknown message type from %s: %s", p.ID, env.Type)
@@ -593,8 +870,20 @@ func main() {
 
 	hub := newHub()
 
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		handleConnection(hub, w, r)
+	// --- HTTP endpoints (Front Desk) ---
+	http.HandleFunc("/create-room", func(w http.ResponseWriter, r *http.Request) {
+		handleCreateRoom(hub, w, r)
+	})
+	http.HandleFunc("/join-room", func(w http.ResponseWriter, r *http.Request) {
+		handleJoinRoom(hub, w, r)
+	})
+	http.HandleFunc("/list-rooms", func(w http.ResponseWriter, r *http.Request) {
+		handleListRooms(hub, w, r)
+	})
+
+	// --- WebSocket endpoint (Game Room) ---
+	http.HandleFunc("/play", func(w http.ResponseWriter, r *http.Request) {
+		handlePlay(hub, w, r)
 	})
 
 	// Simple health check
@@ -604,7 +893,8 @@ func main() {
 	})
 
 	log.Printf("Gotris server starting on :%s", port)
-	log.Printf("WebSocket endpoint: ws://localhost:%s/ws", port)
+	log.Printf("HTTP endpoints: http://localhost:%s/create-room, /join-room, /list-rooms", port)
+	log.Printf("WebSocket endpoint: ws://localhost:%s/play?room=XXXXX&token=...", port)
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGTERM)

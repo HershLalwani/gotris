@@ -143,28 +143,36 @@ func RenderInfo(gs *game.GameState) string {
 	return sb.String()
 }
 
-func RenderLobby(playerNames []string, ready map[string]bool, currentPlayer string) string {
+func RenderLobby(players []protocol.LobbyPlayer, currentPlayerID string, roomCode string) string {
 	var sb strings.Builder
 
 	sb.WriteString(titleStyle.Render("=== LOBBY ===") + "\n\n")
+	if roomCode != "" {
+		sb.WriteString(lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("226")).
+			Render(fmt.Sprintf("Room Code: %s", roomCode)) + "\n")
+		sb.WriteString(infoStyle.Render("Share this code with friends!") + "\n\n")
+	}
 	sb.WriteString(infoStyle.Render("Players in lobby:") + "\n\n")
 
-	for _, name := range playerNames {
+	for _, p := range players {
 		status := notReadyStyle.Render("[ ]")
-		if ready[name] {
+		if p.Ready {
 			status = readyStyle.Render("[✓]")
 		}
 
 		marker := ""
-		if name == currentPlayer {
+		if p.PlayerID == currentPlayerID {
 			marker = " <"
 		}
 
-		sb.WriteString(fmt.Sprintf("%s %s%s\n", status, name, marker))
+		sb.WriteString(fmt.Sprintf("%s %s%s\n", status, p.Name, marker))
 	}
 
 	sb.WriteString("\n")
 	sb.WriteString(infoStyle.Render("Press SPACE to toggle ready") + "\n")
+	sb.WriteString(infoStyle.Render("Press ESC to leave room") + "\n")
 	sb.WriteString(infoStyle.Render("Press Q to quit") + "\n")
 
 	return sb.String()
@@ -283,23 +291,140 @@ func RenderNetOpponents(opponents []protocol.OpponentState, maxDisplay int) stri
 	return sb.String()
 }
 
-func RenderWelcome() string {
+func RenderMainMenu(playerName string) string {
 	return lipgloss.NewStyle().
 		Bold(true).
 		Foreground(lipgloss.Color("51")).
 		Align(lipgloss.Center).
-		Render(`
+		Render(fmt.Sprintf(`
 ╔══════════════════════════════╗
 ║          G O T R I S         ║
 ║    Multiplayer Tetris TUI    ║
 ╚══════════════════════════════╝
 
-   [1] Single Player (Practice)
-   [2] Multiplayer (vs Others)
+   Player: %s
 
-   Press 1/2 or S/ENTER to select
+   [1] Single Player (Practice)
+   [2] Create Room
+   [3] Join Room (by code)
+   [4] Browse Rooms
+   [5] Edit Name
+
    Press Q to quit
-`)
+`, playerName))
+}
+
+func RenderEditName(currentInput string) string {
+	return lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("51")).
+		Align(lipgloss.Center).
+		Render(fmt.Sprintf(`
+=== Edit Name ===
+
+Type your name: %s_
+
+Press ENTER to confirm
+Press ESC to cancel
+`, currentInput))
+}
+
+func RenderJoinRoom(currentInput string, errorMsg string) string {
+	errLine := ""
+	if errorMsg != "" {
+		errLine = "\n" + lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			Render(errorMsg)
+	}
+	return lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("51")).
+		Align(lipgloss.Center).
+		Render(fmt.Sprintf(`
+=== Join Room ===
+
+Enter room code: %s_
+
+Press ENTER to join
+Press ESC to cancel
+%s`, currentInput, errLine))
+}
+
+func RenderListRooms(rooms []protocol.RoomInfo, errorMsg string, cursor, page int) string {
+	const roomsPerPage = 10
+	var sb strings.Builder
+
+	sb.WriteString(titleStyle.Render("=== Browse Rooms ===") + "\n\n")
+
+	if errorMsg != "" {
+		sb.WriteString(lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			Render(errorMsg) + "\n\n")
+	}
+
+	totalRooms := len(rooms)
+	totalPages := (totalRooms + roomsPerPage - 1) / roomsPerPage
+	if totalPages < 1 {
+		totalPages = 1
+	}
+
+	if totalRooms == 0 {
+		sb.WriteString(infoStyle.Render("No rooms available. Create one!") + "\n")
+	} else {
+		pageStart := page * roomsPerPage
+		pageEnd := pageStart + roomsPerPage
+		if pageEnd > totalRooms {
+			pageEnd = totalRooms
+		}
+
+		sb.WriteString(infoStyle.Render(fmt.Sprintf("     %-8s   %-7s   %s", "Room", "Players", "Status")) + "\n")
+		sb.WriteString(infoStyle.Render("     --------   -------   ---------") + "\n")
+
+		for i := pageStart; i < pageEnd; i++ {
+			room := rooms[i]
+			phaseDisplay := room.Phase
+			switch room.Phase {
+			case "lobby":
+				phaseDisplay = readyStyle.Render("Lobby")
+			case "playing":
+				phaseDisplay = notReadyStyle.Render("Playing")
+			case "countdown":
+				phaseDisplay = lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Render("Starting")
+			case "game_over":
+				phaseDisplay = infoStyle.Render("Finished")
+			}
+
+			prefix := "  "
+			rowStyle := infoStyle
+			if i-pageStart == cursor {
+				prefix = "> "
+				rowStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("51")).
+					Bold(true)
+			}
+			sb.WriteString(rowStyle.Render(fmt.Sprintf("%s   %-8s   %d/%-5d   ",
+				prefix, room.RoomID, room.PlayerCount, room.MaxPlayers)))
+			sb.WriteString(phaseDisplay + "\n")
+		}
+
+		if totalPages > 1 {
+			sb.WriteString("\n")
+			sb.WriteString(infoStyle.Render(fmt.Sprintf("  Page %d / %d", page+1, totalPages)) + "\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	if totalRooms > 0 {
+		sb.WriteString(infoStyle.Render("  ↑/↓  Select room") + "\n")
+		if totalPages > 1 {
+			sb.WriteString(infoStyle.Render("  ←/→  Change page") + "\n")
+		}
+		sb.WriteString(infoStyle.Render("  ENTER  Join selected room") + "\n")
+	}
+	sb.WriteString(infoStyle.Render("  R      Refresh") + "\n")
+	sb.WriteString(infoStyle.Render("  ESC    Go back") + "\n")
+
+	return sb.String()
 }
 
 func RenderSingleGameOver(score int) string {

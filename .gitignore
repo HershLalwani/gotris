@@ -11,3 +11,4 @@ go.work
 .vscode/
 .DS_Store
 .ssh
+dist/

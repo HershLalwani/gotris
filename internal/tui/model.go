@@ -28,7 +28,10 @@ type Screen int
 
 const (
 	ScreenConnecting Screen = iota
-	ScreenWelcome
+	ScreenMainMenu
+	ScreenEditName
+	ScreenJoinRoom
+	ScreenListRooms
 	ScreenLobby
 	ScreenCountdown
 	ScreenPlaying
@@ -71,18 +74,25 @@ type Model struct {
 	// Error
 	err          error
 	disconnected bool
+
+	// Room state
+	roomCode       string
+	roomInput      string
+	nameInput      string
+	roomError      string
+	availableRooms []protocol.RoomInfo
+	roomListCursor int
+	roomListPage   int
 }
 
 // NewModel creates a model for the client TUI.
 // If client is nil, only single-player mode is available.
+// The client no longer needs a WebSocket at startup; it connects on demand.
 func NewModel(playerName string, client *netclient.Client) Model {
-	screen := ScreenConnecting
-	if client == nil {
-		screen = ScreenWelcome
-	}
 	return Model{
-		screen:     screen,
+		screen:     ScreenMainMenu,
 		playerName: playerName,
+		nameInput:  playerName,
 		client:     client,
 		ready:      false,
 	}
@@ -146,6 +156,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case netclient.ServerMsg:
 		return m.handleServerMsg(msg)
+
+	// HTTP response messages
+	case netclient.RoomCreatedHTTPMsg:
+		return m.handleRoomCreatedHTTP(msg)
+	case netclient.RoomJoinedHTTPMsg:
+		return m.handleRoomJoinedHTTP(msg)
+	case netclient.RoomsListedMsg:
+		return m.handleRoomsListed(msg)
 	}
 	return m, nil
 }
@@ -154,8 +172,85 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) handleConnected(msg netclient.ConnectedMsg) (tea.Model, tea.Cmd) {
 	m.playerID = msg.PlayerID
-	m.screen = ScreenWelcome
+	// Don't change screen here; the HTTP response handler already moved us to ScreenLobby
 	return m, nil
+}
+
+func (m Model) handleRoomCreatedHTTP(msg netclient.RoomCreatedHTTPMsg) (tea.Model, tea.Cmd) {
+	if msg.Err != nil {
+		m.roomError = msg.Err.Error()
+		m.screen = ScreenMainMenu
+		return m, nil
+	}
+	m.roomCode = msg.RoomID
+	m.roomError = ""
+	m.screen = ScreenLobby
+	m.ready = false
+	return m, nil
+}
+
+func (m Model) handleRoomJoinedHTTP(msg netclient.RoomJoinedHTTPMsg) (tea.Model, tea.Cmd) {
+	if msg.Err != nil {
+		m.roomError = msg.Err.Error()
+		if m.screen == ScreenConnecting {
+			m.screen = ScreenJoinRoom
+		}
+		return m, nil
+	}
+	m.roomCode = msg.RoomID
+	m.roomError = ""
+	m.screen = ScreenLobby
+	m.ready = false
+	return m, nil
+}
+
+func (m Model) handleRoomsListed(msg netclient.RoomsListedMsg) (tea.Model, tea.Cmd) {
+	if msg.Err != nil {
+		m.roomError = msg.Err.Error()
+		m.screen = ScreenMainMenu
+		return m, nil
+	}
+	m.availableRooms = msg.Rooms
+	m.roomError = ""
+	m.roomListCursor = 0
+	m.roomListPage = 0
+	m.screen = ScreenListRooms
+	return m, nil
+}
+
+// --- HTTP tea.Cmd helpers ---
+
+func createRoomCmd(client *netclient.Client, playerName string) tea.Cmd {
+	return func() tea.Msg {
+		roomID, token, err := client.CreateRoom(playerName)
+		if err != nil {
+			return netclient.RoomCreatedHTTPMsg{Err: err}
+		}
+		if err := client.ConnectToRoom(roomID, token); err != nil {
+			return netclient.RoomCreatedHTTPMsg{RoomID: roomID, Err: err}
+		}
+		return netclient.RoomCreatedHTTPMsg{RoomID: roomID, Token: token}
+	}
+}
+
+func joinRoomHTTPCmd(client *netclient.Client, roomID, playerName string) tea.Cmd {
+	return func() tea.Msg {
+		token, err := client.JoinRoom(roomID, playerName)
+		if err != nil {
+			return netclient.RoomJoinedHTTPMsg{Err: err}
+		}
+		if err := client.ConnectToRoom(roomID, token); err != nil {
+			return netclient.RoomJoinedHTTPMsg{RoomID: roomID, Err: err}
+		}
+		return netclient.RoomJoinedHTTPMsg{RoomID: roomID, Token: token}
+	}
+}
+
+func listRoomsCmd(client *netclient.Client) tea.Cmd {
+	return func() tea.Msg {
+		rooms, err := client.ListRooms()
+		return netclient.RoomsListedMsg{Rooms: rooms, Err: err}
+	}
 }
 
 func (m Model) handleServerMsg(msg netclient.ServerMsg) (tea.Model, tea.Cmd) {
@@ -169,8 +264,10 @@ func (m Model) handleServerMsg(msg netclient.ServerMsg) (tea.Model, tea.Cmd) {
 	case protocol.MsgCountdown:
 		var payload protocol.CountdownPayload
 		if json.Unmarshal(msg.Raw, &payload) == nil {
-			m.countdown = payload.Value
-			if m.screen != ScreenCountdown {
+			// Only transition to countdown from lobby/countdown screens.
+			// Ignore late countdown messages if we're already playing.
+			if m.screen == ScreenLobby || m.screen == ScreenCountdown {
+				m.countdown = payload.Value
 				m.screen = ScreenCountdown
 			}
 		}
@@ -181,7 +278,9 @@ func (m Model) handleServerMsg(msg netclient.ServerMsg) (tea.Model, tea.Cmd) {
 			m.seed = payload.Seed
 			m.matchPlayers = payload.Players
 			m.matchResult = nil
-			m.opponents = nil
+			// Don't clear m.opponents here — keep stale data until
+			// the first MsgOpponentUpdate arrives, preventing a layout
+			// shift where the opponent panel vanishes then reappears.
 
 			// Create seeded game state - local authority
 			m.gameState = game.NewSeededGameState(m.playerID, m.playerName, m.seed)
@@ -217,6 +316,7 @@ func (m Model) handleServerMsg(msg netclient.ServerMsg) (tea.Model, tea.Cmd) {
 			}
 			m.screen = ScreenGameOver
 		}
+
 	}
 
 	return m, nil
@@ -243,8 +343,14 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch m.screen {
-	case ScreenWelcome:
-		return m.handleWelcomeKeys(msg)
+	case ScreenMainMenu:
+		return m.handleMainMenuKeys(msg)
+	case ScreenEditName:
+		return m.handleEditNameKeys(msg)
+	case ScreenJoinRoom:
+		return m.handleJoinRoomKeys(msg)
+	case ScreenListRooms:
+		return m.handleListRoomsKeys(msg)
 	case ScreenLobby:
 		return m.handleLobbyKeys(msg)
 	case ScreenPlaying:
@@ -255,7 +361,7 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) handleWelcomeKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) handleMainMenuKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "1", "s":
 		// Single player - local only, no network
@@ -266,22 +372,179 @@ func (m Model) handleWelcomeKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.gameState = game.NewGameState(m.playerID, m.playerName)
 		return m, gameTickCmd(m.gameState.GetDropSpeed())
-	case "2", "enter":
-		// Multiplayer - join the server lobby
+	case "2":
+		// Create a room via HTTP, then connect WS
 		if m.client == nil {
-			// No server connection - can't do multiplayer
 			return m, nil
 		}
 		m.mode = ModeMulti
-		m.screen = ScreenLobby
-		m.ready = false
+		m.screen = ScreenConnecting
+		m.roomError = ""
+		return m, createRoomCmd(m.client, m.playerName)
+	case "3":
+		// Join a room by code
+		if m.client == nil {
+			return m, nil
+		}
+		m.mode = ModeMulti
+		m.screen = ScreenJoinRoom
+		m.roomInput = ""
+		m.roomError = ""
+		return m, nil
+	case "4":
+		// Browse rooms
+		if m.client == nil {
+			return m, nil
+		}
+		m.screen = ScreenConnecting
+		m.roomError = ""
+		return m, listRoomsCmd(m.client)
+	case "5":
+		// Edit name
+		m.screen = ScreenEditName
+		m.nameInput = m.playerName
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m Model) handleEditNameKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		name := strings.TrimSpace(m.nameInput)
+		if name != "" {
+			m.playerName = name
+		}
+		m.screen = ScreenMainMenu
+		return m, nil
+	case "esc":
+		m.screen = ScreenMainMenu
+		return m, nil
+	case "backspace":
+		if len(m.nameInput) > 0 {
+			m.nameInput = m.nameInput[:len(m.nameInput)-1]
+		}
+		return m, nil
+	default:
+		if len(msg.String()) == 1 && len(m.nameInput) < 20 {
+			m.nameInput += msg.String()
+		}
+		return m, nil
+	}
+}
+
+func (m Model) handleJoinRoomKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		code := strings.TrimSpace(m.roomInput)
+		if code != "" && m.client != nil {
+			m.screen = ScreenConnecting
+			return m, joinRoomHTTPCmd(m.client, code, m.playerName)
+		}
+		return m, nil
+	case "esc":
+		m.screen = ScreenMainMenu
+		m.roomInput = ""
+		m.roomError = ""
+		return m, nil
+	case "backspace":
+		if len(m.roomInput) > 0 {
+			m.roomInput = m.roomInput[:len(m.roomInput)-1]
+		}
+		return m, nil
+	default:
+		if len(msg.String()) == 1 && len(m.roomInput) < 5 {
+			m.roomInput += strings.ToUpper(msg.String())
+		}
+		return m, nil
+	}
+}
+
+func (m Model) handleListRoomsKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	const roomsPerPage = 10
+	totalRooms := len(m.availableRooms)
+	totalPages := (totalRooms + roomsPerPage - 1) / roomsPerPage
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	pageStart := m.roomListPage * roomsPerPage
+	pageEnd := pageStart + roomsPerPage
+	if pageEnd > totalRooms {
+		pageEnd = totalRooms
+	}
+	pageCount := pageEnd - pageStart
+
+	switch msg.String() {
+	case "esc":
+		m.screen = ScreenMainMenu
+		m.availableRooms = nil
+		m.roomError = ""
+		return m, nil
+	case "r":
+		// Refresh room list
 		if m.client != nil {
-			m.client.Send(protocol.Envelope{
-				Type: protocol.MsgJoin,
-				Payload: protocol.JoinPayload{
-					PlayerName: m.playerName,
-				},
-			})
+			m.screen = ScreenConnecting
+			return m, listRoomsCmd(m.client)
+		}
+		return m, nil
+	case "up", "k":
+		if m.roomListCursor > 0 {
+			m.roomListCursor--
+		} else if m.roomListPage > 0 {
+			// Wrap to bottom of previous page
+			m.roomListPage--
+			newStart := m.roomListPage * roomsPerPage
+			newEnd := newStart + roomsPerPage
+			if newEnd > totalRooms {
+				newEnd = totalRooms
+			}
+			m.roomListCursor = newEnd - newStart - 1
+		}
+		return m, nil
+	case "down", "j":
+		if m.roomListCursor < pageCount-1 {
+			m.roomListCursor++
+		} else if m.roomListPage < totalPages-1 {
+			// Wrap to top of next page
+			m.roomListPage++
+			m.roomListCursor = 0
+		}
+		return m, nil
+	case "left", "h":
+		if m.roomListPage > 0 {
+			m.roomListPage--
+			m.roomListCursor = 0
+		}
+		return m, nil
+	case "right", "l":
+		if m.roomListPage < totalPages-1 {
+			m.roomListPage++
+			m.roomListCursor = 0
+			// Clamp cursor to new page size
+			newStart := m.roomListPage * roomsPerPage
+			newEnd := newStart + roomsPerPage
+			if newEnd > totalRooms {
+				newEnd = totalRooms
+			}
+			if m.roomListCursor >= newEnd-newStart {
+				m.roomListCursor = newEnd - newStart - 1
+			}
+		}
+		return m, nil
+	case "enter":
+		if totalRooms > 0 && m.client != nil {
+			idx := pageStart + m.roomListCursor
+			if idx < totalRooms {
+				room := m.availableRooms[idx]
+				if room.Phase != "lobby" {
+					m.roomError = "Cannot join: game already in progress"
+					return m, nil
+				}
+				m.mode = ModeMulti
+				m.screen = ScreenConnecting
+				m.roomError = ""
+				return m, joinRoomHTTPCmd(m.client, room.RoomID, m.playerName)
+			}
 		}
 		return m, nil
 	}
@@ -300,6 +563,18 @@ func (m Model) handleLobbyKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				},
 			})
 		}
+		return m, nil
+	case "esc":
+		// Leave the room: disconnect WebSocket (server handles cleanup)
+		if m.client != nil {
+			m.client.DisconnectFromRoom()
+		}
+		m.screen = ScreenMainMenu
+		m.roomCode = ""
+		m.ready = false
+		m.lobbyPlayers = nil
+		m.disconnected = false
+		m.err = nil
 		return m, nil
 	}
 	return m, nil
@@ -334,7 +609,7 @@ func (m Model) handleGameOverKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
 		if m.mode == ModeSingle {
-			m.screen = ScreenWelcome
+			m.screen = ScreenMainMenu
 			m.mode = ModeNone
 			m.gameState = nil
 		} else {
@@ -345,7 +620,22 @@ func (m Model) handleGameOverKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.opponents = nil
 			m.gameState = nil
 		}
-		return m, nil
+		return m, tickCmd()
+	case "esc":
+		// Leave the room and return to main menu
+		if m.client != nil && m.mode == ModeMulti {
+			m.client.DisconnectFromRoom()
+		}
+		m.screen = ScreenMainMenu
+		m.mode = ModeNone
+		m.roomCode = ""
+		m.ready = false
+		m.matchResult = nil
+		m.opponents = nil
+		m.gameState = nil
+		m.disconnected = false
+		m.err = nil
+		return m, tickCmd()
 	}
 	return m, nil
 }
@@ -353,15 +643,25 @@ func (m Model) handleGameOverKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // --- Tick handlers ---
 
 func (m Model) handleTick() (tea.Model, tea.Cmd) {
-	// Check for local game over in single player
-	if m.mode == ModeSingle && m.gameState != nil && m.gameState.IsGameOver {
-		m.screen = ScreenGameOver
+	// During gameplay/countdown/gameover, don't reschedule the general tick.
+	// Game ticks, snapshot ticks, and server messages handle those screens.
+	if m.screen == ScreenPlaying || m.screen == ScreenCountdown || m.screen == ScreenGameOver {
+		return m, nil
 	}
 	return m, tickCmd()
 }
 
 func (m Model) handleGameTick() (tea.Model, tea.Cmd) {
-	if m.screen != ScreenPlaying || m.gameState == nil || m.gameState.IsGameOver {
+	if m.screen != ScreenPlaying || m.gameState == nil {
+		return m, nil
+	}
+
+	// Check for game over
+	if m.gameState.IsGameOver {
+		if m.mode == ModeSingle {
+			m.screen = ScreenGameOver
+		}
+		// For multiplayer, wait for MsgMatchOver from the server.
 		return m, nil
 	}
 
@@ -441,9 +741,19 @@ func (m Model) View() string {
 
 	switch m.screen {
 	case ScreenConnecting:
-		return m.renderCentered("Connecting to server...")
-	case ScreenWelcome:
-		return m.renderWelcome()
+		connMsg := "Connecting..."
+		if m.roomError != "" {
+			connMsg = m.roomError
+		}
+		return m.renderCentered(connMsg)
+	case ScreenMainMenu:
+		return m.renderMainMenu()
+	case ScreenEditName:
+		return m.renderEditName()
+	case ScreenJoinRoom:
+		return m.renderJoinRoom()
+	case ScreenListRooms:
+		return m.renderListRooms()
 	case ScreenLobby:
 		return m.renderLobby()
 	case ScreenCountdown:
@@ -464,24 +774,40 @@ func (m Model) renderCentered(content string) string {
 		Render(content)
 }
 
-func (m Model) renderWelcome() string {
+func (m Model) renderMainMenu() string {
 	return lipgloss.NewStyle().
 		Width(m.width).
 		Height(m.height).
 		Align(lipgloss.Center, lipgloss.Center).
-		Render(RenderWelcome())
+		Render(RenderMainMenu(m.playerName))
+}
+
+func (m Model) renderEditName() string {
+	return lipgloss.NewStyle().
+		Width(m.width).
+		Height(m.height).
+		Align(lipgloss.Center, lipgloss.Center).
+		Render(RenderEditName(m.nameInput))
+}
+
+func (m Model) renderJoinRoom() string {
+	return lipgloss.NewStyle().
+		Width(m.width).
+		Height(m.height).
+		Align(lipgloss.Center, lipgloss.Center).
+		Render(RenderJoinRoom(m.roomInput, m.roomError))
+}
+
+func (m Model) renderListRooms() string {
+	return lipgloss.NewStyle().
+		Width(m.width).
+		Height(m.height).
+		Align(lipgloss.Center, lipgloss.Center).
+		Render(RenderListRooms(m.availableRooms, m.roomError, m.roomListCursor, m.roomListPage))
 }
 
 func (m Model) renderLobby() string {
-	names := make([]string, len(m.lobbyPlayers))
-	readyMap := make(map[string]bool)
-
-	for i, p := range m.lobbyPlayers {
-		names[i] = p.Name
-		readyMap[p.Name] = p.Ready
-	}
-
-	lobbyContent := RenderLobby(names, readyMap, m.playerName)
+	lobbyContent := RenderLobby(m.lobbyPlayers, m.playerID, m.roomCode)
 
 	return lipgloss.NewStyle().
 		Width(m.width).
