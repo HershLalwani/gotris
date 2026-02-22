@@ -49,6 +49,10 @@ var (
 	winnerStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("226"))
+
+	targetStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("196"))
 )
 
 func RenderBoard(gs *game.GameState, width, height int) string {
@@ -118,7 +122,7 @@ func RenderPiece(p *game.Piece) string {
 	return sb.String()
 }
 
-func RenderInfo(gs *game.GameState) string {
+func RenderInfo(gs *game.GameState, targetName string) string {
 	var sb strings.Builder
 
 	sb.WriteString(titleStyle.Render("GOTRIS") + "\n\n")
@@ -138,6 +142,12 @@ func RenderInfo(gs *game.GameState) string {
 		sb.WriteString(lipgloss.NewStyle().
 			Foreground(lipgloss.Color("196")).
 			Render(fmt.Sprintf("INCOMING: %d", gs.GarbageQueue)))
+	}
+
+	if targetName != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(targetStyle.Render(fmt.Sprintf("TARGET: %s", targetName)) + "\n")
+		sb.WriteString(infoStyle.Render("[Tab] change target"))
 	}
 
 	return sb.String()
@@ -203,7 +213,7 @@ func RenderGameOver(isWinner bool, score int, rank int) string {
 
 // RenderNetOpponentPreview renders a mini-board from a network OpponentState.
 // Shows the full board width (10 cols) and the bottom portion where pieces stack.
-func RenderNetOpponentPreview(opp protocol.OpponentState) string {
+func RenderNetOpponentPreview(opp protocol.OpponentState, isTarget bool) string {
 	previewWidth := game.BoardWidth // full 10 columns
 	previewHeight := 10             // bottom 10 rows of the 20-row board
 	startY := game.BoardHeight - previewHeight
@@ -214,7 +224,11 @@ func RenderNetOpponentPreview(opp protocol.OpponentState) string {
 		MaxWidth(previewWidth).
 		Foreground(lipgloss.Color("15"))
 
-	sb.WriteString(nameStyle.Render(opp.PlayerName) + "\n")
+	if isTarget {
+		sb.WriteString(targetStyle.Render("\u25b6 "+opp.PlayerName) + "\n")
+	} else {
+		sb.WriteString(nameStyle.Render(opp.PlayerName) + "\n")
+	}
 
 	if !opp.Alive {
 		for y := 0; y < previewHeight; y++ {
@@ -255,7 +269,7 @@ func RenderNetOpponentPreview(opp protocol.OpponentState) string {
 }
 
 // RenderNetOpponents renders a grid of opponent previews from network state.
-func RenderNetOpponents(opponents []protocol.OpponentState, maxDisplay int) string {
+func RenderNetOpponents(opponents []protocol.OpponentState, maxDisplay int, targetID string) string {
 	if len(opponents) == 0 {
 		return ""
 	}
@@ -271,7 +285,8 @@ func RenderNetOpponents(opponents []protocol.OpponentState, maxDisplay int) stri
 	cols := 4
 
 	for _, opp := range display {
-		preview := RenderNetOpponentPreview(opp)
+		isTarget := (targetID != "" && opp.PlayerID == targetID)
+		preview := RenderNetOpponentPreview(opp, isTarget)
 		row += lipgloss.NewStyle().
 			Padding(0, 1).
 			Render(preview)

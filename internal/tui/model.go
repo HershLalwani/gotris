@@ -83,6 +83,10 @@ type Model struct {
 	availableRooms []protocol.RoomInfo
 	roomListCursor int
 	roomListPage   int
+
+	// Targeting
+	targetID    string // "" = random, otherwise a player ID
+	targetIndex int    // -1 = random, 0..N-1 = index into opponents
 }
 
 // NewModel creates a model for the client TUI.
@@ -90,11 +94,12 @@ type Model struct {
 // The client no longer needs a WebSocket at startup; it connects on demand.
 func NewModel(playerName string, client *netclient.Client) Model {
 	return Model{
-		screen:     ScreenMainMenu,
-		playerName: playerName,
-		nameInput:  playerName,
-		client:     client,
-		ready:      false,
+		screen:      ScreenMainMenu,
+		playerName:  playerName,
+		nameInput:   playerName,
+		client:      client,
+		ready:       false,
+		targetIndex: -1,
 	}
 }
 
@@ -281,6 +286,10 @@ func (m Model) handleServerMsg(msg netclient.ServerMsg) (tea.Model, tea.Cmd) {
 			// Don't clear m.opponents here — keep stale data until
 			// the first MsgOpponentUpdate arrives, preventing a layout
 			// shift where the opponent panel vanishes then reappears.
+
+			// Reset targeting
+			m.targetID = ""
+			m.targetIndex = -1
 
 			// Create seeded game state - local authority
 			m.gameState = game.NewSeededGameState(m.playerID, m.playerName, m.seed)
@@ -601,6 +610,8 @@ func (m Model) handlePlayingKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.checkLocalGameOver()
 	case "z":
 		m.gameState.Hold()
+	case "tab":
+		m.cycleTarget()
 	}
 	return m, nil
 }
@@ -830,7 +841,26 @@ func (m Model) renderPlaying() string {
 	}
 
 	board := RenderBoard(m.gameState, game.BoardWidth, game.BoardHeight)
-	info := RenderInfo(m.gameState)
+
+	// Build target name for info panel
+	targetName := ""
+	if m.mode == ModeMulti {
+		if m.targetID == "" {
+			targetName = "Random"
+		} else {
+			for _, opp := range m.opponents {
+				if opp.PlayerID == m.targetID {
+					targetName = opp.PlayerName
+					break
+				}
+			}
+			if targetName == "" {
+				targetName = "Random" // target left, reset display
+			}
+		}
+	}
+
+	info := RenderInfo(m.gameState, targetName)
 
 	leftPanel := lipgloss.NewStyle().
 		Width(24).
@@ -847,7 +877,7 @@ func (m Model) renderPlaying() string {
 	)
 
 	if m.mode == ModeMulti && len(m.opponents) > 0 {
-		opponentView := RenderNetOpponents(m.opponents, 8)
+		opponentView := RenderNetOpponents(m.opponents, 8, m.targetID)
 		if opponentView != "" {
 			rightPanel := lipgloss.NewStyle().
 				Padding(1, 2).
@@ -893,6 +923,62 @@ func (m Model) renderGameOver() string {
 		Height(m.height).
 		Align(lipgloss.Center, lipgloss.Center).
 		Render(content)
+}
+
+// cycleTarget cycles the attack target: random → opponent 0 → opponent 1 → ... → random.
+func (m *Model) cycleTarget() {
+	if m.mode != ModeMulti || len(m.opponents) == 0 {
+		return
+	}
+
+	// Count alive opponents
+	var aliveIDs []string
+	for _, opp := range m.opponents {
+		if opp.Alive {
+			aliveIDs = append(aliveIDs, opp.PlayerID)
+		}
+	}
+	if len(aliveIDs) == 0 {
+		m.targetID = ""
+		m.targetIndex = -1
+		return
+	}
+
+	// Find current position in alive list
+	currentPos := -1 // -1 = random
+	for i, id := range aliveIDs {
+		if id == m.targetID {
+			currentPos = i
+			break
+		}
+	}
+
+	// Advance to next
+	nextPos := currentPos + 1
+	if nextPos >= len(aliveIDs) {
+		// Wrap back to random
+		m.targetID = ""
+		m.targetIndex = -1
+	} else {
+		m.targetID = aliveIDs[nextPos]
+		// Find the index in the full opponents list for rendering
+		for i, opp := range m.opponents {
+			if opp.PlayerID == m.targetID {
+				m.targetIndex = i
+				break
+			}
+		}
+	}
+
+	// Notify the server
+	if m.client != nil {
+		m.client.Send(protocol.Envelope{
+			Type: protocol.MsgSetTarget,
+			Payload: protocol.SetTargetPayload{
+				TargetID: m.targetID,
+			},
+		})
+	}
 }
 
 func (m Model) GetPlayerID() string {

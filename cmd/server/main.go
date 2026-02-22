@@ -43,13 +43,14 @@ var upgrader = websocket.Upgrader{
 // --- Player (server-side) ---
 
 type Player struct {
-	ID     string
-	Name   string
-	Ready  bool
-	Alive  bool
-	Conn   *websocket.Conn
-	sendCh chan []byte
-	roomID string
+	ID       string
+	Name     string
+	Ready    bool
+	Alive    bool
+	Conn     *websocket.Conn
+	sendCh   chan []byte
+	roomID   string
+	TargetID string // who this player wants to attack ("" = random)
 	// Latest snapshot from this client
 	mu       sync.Mutex
 	Snapshot *protocol.BoardSnapshotPayload
@@ -340,19 +341,33 @@ func (r *Room) handleLinesCleared(attackerID string, payload protocol.LinesClear
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Pick a random alive opponent
-	var targets []string
-	for id, p := range r.players {
-		if id != attackerID && p.Alive {
-			targets = append(targets, id)
-		}
-	}
-
-	if len(targets) == 0 {
+	attacker := r.players[attackerID]
+	if attacker == nil {
 		return
 	}
 
-	targetID := targets[rand.Intn(len(targets))]
+	// Determine target: use player's stored target if they're alive, else random.
+	targetID := attacker.TargetID
+	if targetID != "" {
+		if t, ok := r.players[targetID]; !ok || !t.Alive || targetID == attackerID {
+			targetID = "" // target invalid, fall back to random
+		}
+	}
+
+	if targetID == "" {
+		// Pick a random alive opponent
+		var candidates []string
+		for id, p := range r.players {
+			if id != attackerID && p.Alive {
+				candidates = append(candidates, id)
+			}
+		}
+		if len(candidates) == 0 {
+			return
+		}
+		targetID = candidates[rand.Intn(len(candidates))]
+	}
+
 	target := r.players[targetID]
 	if target != nil {
 		target.send(protocol.Envelope{
@@ -851,6 +866,14 @@ func handleMessage(p *Player, hub *Hub, env protocol.Envelope, raw []byte) {
 			if room != nil {
 				room.handleLinesCleared(p.ID, payload)
 			}
+		}
+
+	case protocol.MsgSetTarget:
+		var payload protocol.SetTargetPayload
+		if extractPayload(raw, &payload) == nil {
+			p.mu.Lock()
+			p.TargetID = payload.TargetID
+			p.mu.Unlock()
 		}
 
 	case protocol.MsgPlayerDead:

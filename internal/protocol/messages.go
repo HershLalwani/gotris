@@ -27,6 +27,7 @@ const (
 	MsgJoinRoom      MessageType = "join_room"
 	MsgLeaveRoom     MessageType = "leave_room"
 	MsgSetName       MessageType = "set_name"
+	MsgSetTarget     MessageType = "set_target"
 )
 
 // Envelope is the top-level wire format for all messages.
@@ -126,8 +127,15 @@ type BoardSnapshotPayload struct {
 
 // LinesClearedPayload informs the server that lines were cleared.
 type LinesClearedPayload struct {
-	Count       int `json:"count"`
-	AttackPower int `json:"attack_power"`
+	Count       int    `json:"count"`
+	AttackPower int    `json:"attack_power"`
+	TargetID    string `json:"target_id,omitempty"` // explicit target, empty = use server-stored target
+}
+
+// SetTargetPayload tells the server who this player wants to attack.
+// Empty TargetID means "random".
+type SetTargetPayload struct {
+	TargetID string `json:"target_id"`
 }
 
 // PlayerDeadPayload informs the server this player has died.
